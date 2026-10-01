@@ -1,180 +1,92 @@
-# moonlight-ps4
+# Moonlight PS4 Pro Enhanced
 
-Unofficial [Moonlight](https://moonlight-stream.org/) port (Sunshine/GameStream
-game-streaming client) for jailbroken PS4 (GoldHEN), built on the
-[OpenOrbis](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain) toolchain.
+## 4K30 on PS4 Pro - hardware decoded and real-game tested
 
-Full port plan: [PLAN.md](PLAN.md).
+An enhanced PS4 Pro build of [Moonlight-PS4](https://github.com/JaimeJimenezG/Moonlight-ps4), based on v1.1.0.
 
-**Current version: 1.1.0**
+## Highlights
 
-## Status
+- 3840x2160 @ 30 FPS streaming
+- H.264 hardware decoding via PS4 Videodec2
+- Tested at 40 Mbps
+- DualShock 4 input
+- Opus stereo audio
+- Real-game tested with Kingdom Come: Deliverance and Satisfactory
+- 1080p60 remains available for lower-latency gaming
 
-### Iteration 1 — playable software client
+## 4K30
 
-- [x] Phase 0: toolchain, CMake, hello-world `.pkg`, UDP logging
-- [x] Phase 1: protocol core (pairing, applist, launch, streaming) validated on Linux against Sunshine
-- [x] Phase 2: PS4 platform layer for moonlight-common-c
-- [x] Phase 3: audio (Opus + `sceAudioOut`)
-- [x] Phase 4: software video (FFmpeg H.264 + `sceVideoOut`)
-- [x] Phase 5: input (`scePad`, DualShock 4)
-- [x] Phase 7 (partial): INI config + on-console UI menu (APPS / SETTINGS + on-screen keyboard); packaging `.pkg`
+4K30 works especially well for slower-paced and controller-friendly games.
 
+For competitive FPS and other latency-sensitive games, 1080p60 is recommended.
 
+## Tested setup
 
-### Iteration 2 — Faster
+- PS4 Pro
+- Firmware 12.50
+- GoldHEN 2.4b18.7
+- Sunshine 2026.516.143833
+- 3840x2160 @ 30 FPS
+- 40000 kbps
+- H.264
+- Hardware decoder enabled
+- YCbCr disabled
 
-- [x] Native YCbCr/NV12 presentation on `sceVideoOut` (optional; experimental)
-- [x] Hardware decoder via `libSceVideodec2` (`prefer_hw` in INI; always compiled in)
-- [x] On-console UI menu with applist, settings, pairing PIN screen
-- [ ] Broader console validation (see `[docs/CONSOLE_VALIDATE.md](docs/CONSOLE_VALIDATE.md)`)
-- [ ] mDNS host discovery
-- [ ] Advanced frame pacing (`presentationTimeUs` / `rtpTimestamp`)
-- [ ] Upstream `__ORBIS__` to moonlight-common-c
+Other PS4 models and firmware versions have not been validated with this release.
 
+## YCbCr / firmware warning
 
+> [!WARNING]
+> `ycbcr_kpatch_900.bin` is intended for firmware 9.00 only.
+>
+> Do NOT use it on any other firmware version.
+>
+> On firmware 12.50, Moonlight PS4 Pro Enhanced was tested with YCbCr disabled and the BGRA presentation path.
 
-## Requirements (development)
+The firmware-9.00 YCbCr patch is intentionally not included in this release.
 
-- Linux x86_64 with `clang`, `ld.lld`, `cmake`, `ninja`, `git`, and `curl`
-- OpenOrbis toolchain v0.5.4 (default: `~/ps4dev/OpenOrbis/PS4Toolchain`)
-- Cross-built FFmpeg for PS4 (H.264 decoder only): `scripts/build_ffmpeg_ps4.sh`
-- For `PkgTool.Core`: `libssl.so.1.1` / `libcrypto.so.1.1` in `~/ps4dev/hostlibs/usr/lib`
-- PS4 with GoldHEN-compatible firmware (plan validated on **9.00**)
-- Host PC running [Sunshine](https://github.com/LizardByte/Sunshine)
+## Installation
 
+1. Download `Moonlight-PS4-Pro-Enhanced-4K30.pkg`.
+2. Install the PKG on your already modified PS4.
+3. Start Sunshine on the gaming PC.
+4. Start Moonlight on the PS4.
+5. Pair with Sunshine when prompted.
+6. Select an application and start streaming.
 
+Recommended tested 4K30 settings:
 
-## Dependencies (third_party)
+- Resolution: 3840x2160
+- FPS: 30
+- Bitrate: 40000 kbps
+- Codec: H.264
+- Hardware decoder: enabled
+- YCbCr: disabled
 
-Vendored libraries live as **git submodules** pinned in [`third_party/DEPS`](third_party/DEPS).
-Git only stores the commit SHA for each submodule — not a full copy of upstream.
-Orbis-specific fixes are **not** committed inside those repos; they live under
-[`patches/`](patches/) and are applied after checkout.
+For lower input latency, use 1920x1080 @ 60 FPS.
 
-```bash
-git clone <this-repo>
-scripts/setup_deps.sh    # checkout pins from third_party/DEPS + apply patches/
-```
+## Release package
 
-Equivalent manual flow: `git submodule update --init --recursive` then
-`scripts/apply_patches.sh`. After patches, `third_party/*` working trees look
-dirty — that is expected; commit patch files, not submodule dirt.
+The release binary intentionally keeps the internal upstream version `1.1.0`.
 
-To bump a dependency on purpose: edit the pin in `third_party/DEPS`, update the
-submodule to that commit, refresh patches if needed (`scripts/refresh_patches.sh`),
-and commit the new gitlink + DEPS (+ patches).
+SHA-256:
 
-## Build
+`99ff7b50559f359d2b660b9ade0a1151d9b795999221b3240a2a7f28118a8b71`
 
-```bash
-git clone <this-repo>
-cd moonlight-ps4
-scripts/setup_deps.sh                # pinned third_party + Orbis patches
-scripts/build_ffmpeg_ps4.sh          # once (→ ~/ps4dev/ffmpeg-ps4)
+## Credits
 
-# PS4 app + .pkg (sources env.sh, configures, builds, packages)
-scripts/build_pkg.sh
-# scripts/build_pkg.sh --clean       # wipe build-ps4/ and reconfigure
+Based on Moonlight-PS4 by Jaime Jimenez:
 
-# Optional: Linux development CLI (pairing / H.264 dump)
-cmake -B build-host -G Ninja && cmake --build build-host
-```
+https://github.com/JaimeJimenezG/Moonlight-ps4
 
-Installable artifact: `build-ps4/Moonlight-1.1.0.pkg`
-(also `IV0000-MLNT00001_00-MOONLIGHTPS40000.pkg`).
+Permission to publish the modified source and compiled homebrew package:
 
-`build_pkg.sh` runs `source scripts/env.sh` itself. Manual CMake equivalent:
+https://github.com/JaimeJimenezG/Moonlight-ps4/issues/4
 
-```bash
-source scripts/env.sh
-cmake -B build-ps4 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/openorbis.cmake
-cmake --build build-ps4
-```
+Thanks to Jaime for creating the original PS4 port.
 
-## Usage on PS4
+This project also uses Moonlight Common C, OpenOrbis, OpenGNM, FFmpeg, Opus, Mbed TLS, ENet, NanoRS and h264bitstream.
 
-1. Install the `.pkg` (Package Installer / GoldHEN / FTP). The package uses
-  `CATEGORY=gd` (required so GoldHEN injects plugins).
-2. Optional — YCbCr presentation (`prefer_ycbcr=true`, experimental):
-  - Copy `plugin/bin/ycbcr_unlock.prx` → `/data/GoldHEN/plugins/`
-  - Add `[MLNT00001]` in `/data/GoldHEN/plugins.ini`
-  (see `[plugin/README.md](plugin/README.md)` and `plugin/plugins.ini.example`)
-  - GoldHEN → Enable plugins
-  - After each reboot, send the kpayload once:
-  `nc -w 3 <PS4_IP> 9090 < plugin/bin/ycbcr_kpatch_900.bin`
-3. On first launch the app opens the **SETTINGS** menu if no host is set. You can
-  also create `/data/moonlight/moonlight.ini` over FTP (see
-   `pkg/assets/misc/moonlight.ini`). Optional: `debug_host.txt` with your PC IP.
-4. Start Sunshine on the PC. On first pair the app shows a PIN (also written to
-  `/data/moonlight/pin.txt`); enter it at `https://<pc>:47990/pin`.
-5. Logs on the PC: `nc -ulk 9999` (or enable file log in SETTINGS →
-  `/data/moonlight/debug.log`).
-6. In the menu: **X/O** start app, **L1/R1** switch APPS/SETTINGS,
-  **OPTIONS** quit active Sunshine session, **OPTIONS + Touchpad** (~1 s) exit stream.
+## Disclaimer
 
-
-
-### Defaults
-
-
-| Setting          | Default                                                        |
-| ---------------- | -------------------------------------------------------------- |
-| Resolution / FPS | 1920×1080 @ 60                                                 |
-| Bitrate          | 20 Mbps, H.264                                                 |
-| `prefer_hw`      | `true` (Videodec2)                                             |
-| `prefer_ycbcr`   | `false` (BGRA path; correct colors, SSE2 multi-thread convert) |
-| Title ID         | `MLNT00001`                                                    |
-
-
-Mean decode/convert/present times are printed every second over UDP.
-Validation protocol: `[docs/CONSOLE_VALIDATE.md](docs/CONSOLE_VALIDATE.md)`.
-
-Isolated Videodec2 spike: `videodec2_spike = true` in the INI.
-
-## Host CLI (Linux)
-
-```bash
-./build-host/moonlight-cli pair 192.168.1.100
-./build-host/moonlight-cli list 192.168.1.100
-./build-host/moonlight-cli stream 192.168.1.100 --res 1280x720 --time 20
-./build-host/moonlight-cli quit 192.168.1.100
-```
-
-
-
-## Layout
-
-```
-cmake/openorbis.cmake           CMake toolchain for PS4
-pkg/                            package assets (icon0, sce modules)
-scripts/                        env, cross FFmpeg, .pkg packaging
-src/
-  main.c stream.c config.c      orchestration + INI config
-  ui/                           on-console menu (APPS / SETTINGS + OSK)
-  gamestream/                   pairing/HTTP/XML over mbedTLS
-  audio/audio_orbis.c           Opus + sceAudioOut
-  video/renderer_videoout.c     YCbCr/NV12 or BGRA presentation (sceVideoOut)
-  video/nv12_blit.c             1088→1080 copy (WB_GARLIC / Onion alias)
-  video/decoder_ffmpeg.c        H.264 software (FFmpeg)
-  video/decoder_orbis.c         H.264 hardware (libSceVideodec2)
-  gamestream/sps.c              SPS fixup (num_ref_frames=1)
-  input/input_pad.c             DualShock 4
-  orbis/                        VideoOut / Videodec2 / net helpers
-  host/main_cli.c               Linux development CLI
-plugin/
-  ycbcr_unlock/                 GoldHEN PRX (1.63) for YCbCr VideoOut
-  ycbcr_kpatch/                 FW 9.00 kernel kpayload (BinLoader)
-  kernel_dumper_900/            kernel dump helper for RE
-docs/                           console validation + kernel YCbCr RE notes
-third_party/
-  DEPS                        pinned tags/SHAs (lockfile for setup_deps.sh)
-  moonlight-common-c          protocol engine (submodule + Orbis patches)
-  mbedtls                     crypto (v3.6.4)
-  opus                        audio
-  h264bitstream               SPS rewrite
-patches/                      Orbis patches applied by scripts/apply_patches.sh
-scripts/setup_deps.sh         checkout pins + apply patches
-scripts/apply_patches.sh
-scripts/refresh_patches.sh    regenerate patches after local dep edits
-```
+Moonlight PS4 Pro Enhanced is an unofficial community project.

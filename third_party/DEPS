@@ -17,3 +17,6 @@ h264bitstream          third_party/h264bitstream                 https://github.
 # Nested submodules of moonlight-common-c (also pinned for reproducibility)
 enet                   third_party/moonlight-common-c/enet       https://github.com/cgutman/enet.git                         aca87840b57f045a1f7f9299e4b1b9b8e2a5e2f1
 nanors                 third_party/moonlight-common-c/nanors     https://github.com/sleepybishop/nanors.git                  b1e3c22ca0cdc0bb83e3cd6ed1a2fc77869ed99a
+
+# PS4 Pro 4K30 surface-address / tiling support
+opengnm                third_party/opengnm                       https://github.com/PS4-OpenGNM/opengnm.git                    4b295ca54c82c83acf308d1c646a2dfa9ae57350

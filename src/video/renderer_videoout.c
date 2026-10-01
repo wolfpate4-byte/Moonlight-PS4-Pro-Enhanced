@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <gpuaddr.h>
 #include <emmintrin.h> /* SSE2 — Jaguar PS4 */
 
 #define FB_COUNT_MAX 3
@@ -61,6 +62,7 @@ typedef struct {
     int pitch_uv;
     int nbands;
     const int *x_lut; /* dst-col -> src-col; NULL when src/dst sizes match */
+    int tiled4k;      /* direct NV12 -> native 4K display-tiled BGRA */
 } nv12_bgra_job_t;
 
 #define BGRA_WORKERS_MAX 6
@@ -96,6 +98,15 @@ static void bgra_convert_kick(uint8_t *dst, int dst_pitch,
                               const uint8_t *y, const uint8_t *uv,
                               int pitch_y, int pitch_uv, int main_helps);
 static void bgra_convert_wait(void);
+
+/* Native 3840x2160 tiled-output helpers. */
+static int fast4k_prepare_lut(void);
+static void fast4k_nv12_to_tiled_rows(uint8_t *dst,
+                                      int row0, int row1,
+                                      const uint8_t *y,
+                                      const uint8_t *uv,
+                                      int pitch_y,
+                                      int pitch_uv);
 
 static void fill_solid_u32(uint8_t *dst, int pitch, int h, int width, uint32_t pix) {
     size_t ysz = (size_t)pitch * (size_t)h;
@@ -263,16 +274,603 @@ static int register_ycbcr(int attr_w, int h, uint32_t pitch, uint32_t tiling) {
 static int register_bgra(int w, int h, uint32_t pitch) {
     MlVideoOutBufferAttribute attr;
     memset(&attr, 0, sizeof(attr));
+
+    const uint32_t tiling =
+        (w == 3840 && h == 2160)
+            ? ML_VIDEO_OUT_TILING_TILE
+            : ML_VIDEO_OUT_TILING_LINEAR;
+
     sceVideoOutSetBufferAttribute(&attr,
                                   ML_VIDEO_OUT_PIXEL_B8G8R8A8,
-                                  ML_VIDEO_OUT_TILING_LINEAR,
+                                  tiling,
                                   ML_VIDEO_OUT_ASPECT_16_9,
                                   (uint32_t)w, (uint32_t)h, pitch);
+
+    uint32_t option = 0;
+    uint32_t reserved0 = 0;
+    uint64_t reserved1 = 0;
+
+    memcpy(&option,    (const uint8_t *)&attr + 0x18, sizeof(option));
+    memcpy(&reserved0, (const uint8_t *)&attr + 0x1c, sizeof(reserved0));
+    memcpy(&reserved1, (const uint8_t *)&attr + 0x20, sizeof(reserved1));
+
+    LOGI("present: BGRA attr size=%zu fmt=0x%08x tmode=%d aspect=%d "
+         "w=%u h=%u pitch=%u option=0x%08x "
+         "reserved0=0x%08x reserved1=0x%016llx",
+         sizeof(attr),
+         (unsigned)attr.format,
+         attr.tmode,
+         attr.aspect,
+         (unsigned)attr.width,
+         (unsigned)attr.height,
+         (unsigned)attr.pixelPitch,
+         (unsigned)option,
+         (unsigned)reserved0,
+         (unsigned long long)reserved1);
+
     int rc = sceVideoOutRegisterBuffers(s_video, 0, (void *const *)s_fb, s_fb_count,
                                         &attr);
-    LOGI("present: BGRA try pitch=%u %dx%d n=%d => 0x%08x",
-         pitch, w, h, s_fb_count, (unsigned)rc);
+    LOGI("present: BGRA try tile=%u pitch=%u %dx%d n=%d => 0x%08x",
+         tiling, pitch, w, h, s_fb_count, (unsigned)rc);
     return rc;
+}
+
+static void log_resolution_status(void) {
+    MlVideoOutResolutionStatus st;
+    memset(&st, 0, sizeof(st));
+
+    int32_t rc = sceVideoOutGetResolutionStatus(s_video, &st);
+    LOGI("present: resolution status rc=0x%08x output=%ux%u pane=%ux%u "
+         "refresh_raw=%llu screen=%.2f flags=0x%04x",
+         (unsigned)rc,
+         st.width, st.height,
+         st.paneWidth, st.paneHeight,
+         (unsigned long long)st.refreshRate,
+         (double)st.screenSize,
+         (unsigned)st.flags);
+}
+
+static void log_symbol_head(const char *name, const void *sym) {
+    if (!sym) {
+        LOGW("present: symhead %s unavailable", name);
+        return;
+    }
+
+    uint8_t b[96];
+    memcpy(b, sym, sizeof(b));
+
+    LOGI("present: symhead %s addr=%p", name, sym);
+
+    for (int off = 0; off < 96; off += 16) {
+        LOGI("present: symhead %s +%02x "
+             "%02x %02x %02x %02x %02x %02x %02x %02x "
+             "%02x %02x %02x %02x %02x %02x %02x %02x",
+             name, off,
+             (unsigned)b[off + 0],  (unsigned)b[off + 1],
+             (unsigned)b[off + 2],  (unsigned)b[off + 3],
+             (unsigned)b[off + 4],  (unsigned)b[off + 5],
+             (unsigned)b[off + 6],  (unsigned)b[off + 7],
+             (unsigned)b[off + 8],  (unsigned)b[off + 9],
+             (unsigned)b[off + 10], (unsigned)b[off + 11],
+             (unsigned)b[off + 12], (unsigned)b[off + 13],
+             (unsigned)b[off + 14], (unsigned)b[off + 15]);
+    }
+}
+
+static void log_symbol_512(const char *name, const void *sym) {
+    if (!sym) {
+        LOGW("present: sym512 %s unavailable", name);
+        return;
+    }
+
+    uint8_t b[512];
+    memcpy(b, sym, sizeof(b));
+
+    LOGI("present: sym512 %s addr=%p", name, sym);
+
+    for (int off = 0; off < 512; off += 16) {
+        LOGI("present: sym512 %s +%03x "
+             "%02x %02x %02x %02x %02x %02x %02x %02x "
+             "%02x %02x %02x %02x %02x %02x %02x %02x",
+             name, off,
+             (unsigned)b[off + 0],  (unsigned)b[off + 1],
+             (unsigned)b[off + 2],  (unsigned)b[off + 3],
+             (unsigned)b[off + 4],  (unsigned)b[off + 5],
+             (unsigned)b[off + 6],  (unsigned)b[off + 7],
+             (unsigned)b[off + 8],  (unsigned)b[off + 9],
+             (unsigned)b[off + 10], (unsigned)b[off + 11],
+             (unsigned)b[off + 12], (unsigned)b[off + 13],
+             (unsigned)b[off + 14], (unsigned)b[off + 15]);
+    }
+}
+
+static void log_symbol_256(const char *name, const void *sym) {
+    if (!sym) {
+        LOGW("present: sym256 %s unavailable", name);
+        return;
+    }
+
+    uint8_t b[256];
+    memcpy(b, sym, sizeof(b));
+
+    LOGI("present: sym256 %s addr=%p", name, sym);
+
+    for (int off = 0; off < 256; off += 16) {
+        LOGI("present: sym256 %s +%03x "
+             "%02x %02x %02x %02x %02x %02x %02x %02x "
+             "%02x %02x %02x %02x %02x %02x %02x %02x",
+             name, off,
+             (unsigned)b[off + 0],  (unsigned)b[off + 1],
+             (unsigned)b[off + 2],  (unsigned)b[off + 3],
+             (unsigned)b[off + 4],  (unsigned)b[off + 5],
+             (unsigned)b[off + 6],  (unsigned)b[off + 7],
+             (unsigned)b[off + 8],  (unsigned)b[off + 9],
+             (unsigned)b[off + 10], (unsigned)b[off + 11],
+             (unsigned)b[off + 12], (unsigned)b[off + 13],
+             (unsigned)b[off + 14], (unsigned)b[off + 15]);
+    }
+}
+
+static void *s_reg_probe_receiver = NULL;
+
+static void log_4k_receiver_state(const char *tag) {
+    if (!s_reg_probe_receiver) {
+        LOGW("present: 4k receiver state %s unavailable", tag);
+        return;
+    }
+
+    const uint8_t *p = (const uint8_t *)s_reg_probe_receiver;
+
+    uint32_t f434 = 0;
+    uint64_t priv450 = 0;
+    uint32_t f46c = 0;
+    uint32_t f474 = 0;
+    uint32_t f47c = 0;
+    uint32_t f480 = 0;
+    uint32_t f484 = 0;
+
+    memcpy(&f434,    p + 0x434, sizeof(f434));
+    memcpy(&priv450,p + 0x450, sizeof(priv450));
+    memcpy(&f46c,    p + 0x46c, sizeof(f46c));
+    memcpy(&f474,    p + 0x474, sizeof(f474));
+    memcpy(&f47c,    p + 0x47c, sizeof(f47c));
+    memcpy(&f480,    p + 0x480, sizeof(f480));
+    memcpy(&f484,    p + 0x484, sizeof(f484));
+
+    LOGI("present: 4k receiver state %s receiver=%p "
+         "f434=%u priv450=0x%016llx f46c=%u "
+         "f474=%u f47c=%u f480=%u f484=%u",
+         tag, s_reg_probe_receiver,
+         (unsigned)f434,
+         (unsigned long long)priv450,
+         (unsigned)f46c,
+         (unsigned)f474,
+         (unsigned)f47c,
+         (unsigned)f480,
+         (unsigned)f484);
+}
+
+static void log_4k_symbol_probe(void) {
+    extern uint32_t sceKernelLoadStartModule(const char *, size_t, const void *,
+                                             uint32_t, void *, void *);
+    extern int32_t sceKernelDlsym(int32_t, const char *, void **);
+
+    static const char *paths[] = {
+        "/system/common/lib/libSceVideoOut.sprx",
+        "libSceVideoOut.sprx",
+        NULL,
+    };
+
+    int mod = -1;
+    for (int i = 0; paths[i]; i++) {
+        int rc = (int)sceKernelLoadStartModule(paths[i], 0, NULL, 0, NULL, NULL);
+        LOGI("present: 4k symprobe LoadStartModule(%s) => 0x%08x",
+             paths[i], (unsigned)rc);
+        if (rc > 0) {
+            mod = rc;
+            break;
+        }
+    }
+
+    if (mod < 0) {
+        LOGW("present: 4k symprobe could not load VideoOut SPRX");
+        return;
+    }
+
+    static const char *names[] = {
+        "sceVideoOutAddBuffer4k2kPrivilege",
+        "sceVideoOutModeSetAny_",
+        "sceVideoOutConfigureOutputMode_",
+        "sceVideoOutGetCurrentOutputMode_",
+        "sceVideoOutGetDeviceCapabilityInfo_",
+        "sceVideoOutHdmiMonitorInfoIsSupportedVideoOutMode_",
+        NULL,
+    };
+
+    for (int i = 0; names[i]; i++) {
+        void *sym = NULL;
+        int32_t rc = sceKernelDlsym(mod, names[i], &sym);
+        LOGI("present: 4k symprobe %-48s rc=0x%08x found=%d",
+             names[i], (unsigned)rc, sym != NULL);
+    }
+
+    void *reg_sym = NULL;
+    int32_t reg_drc = sceKernelDlsym(
+        mod, "sceVideoOutRegisterBuffers", &reg_sym);
+
+    LOGI("present: RegisterBuffers code probe rc=0x%08x found=%d",
+         (unsigned)reg_drc, reg_sym != NULL);
+
+    if (reg_drc == 0 && reg_sym) {
+        log_symbol_256("sceVideoOutRegisterBuffers", reg_sym);
+
+        /*
+         * FW 12.50 wrapper:
+         *   +0x31: E8 rel32   -> internal handle resolver
+         *
+         * Decode only; do NOT call it.
+         */
+        const uint8_t *code = (const uint8_t *)reg_sym;
+
+        if (code[0x31] == 0xe8) {
+            int32_t rel = 0;
+            memcpy(&rel, code + 0x32, sizeof(rel));
+
+            uintptr_t target_addr =
+                (uintptr_t)reg_sym + 0x36u + (intptr_t)rel;
+
+            void *resolver = (void *)target_addr;
+
+            LOGI("present: RegisterBuffers resolver target=%p rel=%d",
+                 resolver, (int)rel);
+
+            log_symbol_256("RegisterBuffers.handle_resolver", resolver);
+
+            /*
+             * FW 12.50 resolver:
+             *   +0x42: lea rcx,[rip+disp32] -> 16-byte handle-slot table
+             *
+             * Slot index is the low byte of the public handle.
+             * Read only; do not call the resolver or driver method.
+             */
+            const uint8_t *rcode = (const uint8_t *)resolver;
+
+            if (rcode[0x42] == 0x48 &&
+                rcode[0x43] == 0x8d &&
+                rcode[0x44] == 0x0d) {
+                int32_t table_rel = 0;
+                memcpy(&table_rel, rcode + 0x45, sizeof(table_rel));
+
+                uintptr_t table_addr =
+                    (uintptr_t)resolver + 0x49u + (intptr_t)table_rel;
+
+                unsigned slot =
+                    (unsigned)((uint32_t)s_video & 0xffu);
+
+                LOGI("present: RegisterBuffers handle table=%p slot=%u handle=0x%08x",
+                     (void *)table_addr, slot, (unsigned)s_video);
+
+                if (s_video > 0 && slot <= 3) {
+                    const uint8_t *slotp =
+                        (const uint8_t *)table_addr + slot * 16u;
+
+                    uint32_t stored_handle = 0;
+                    void *dispatch = NULL;
+
+                    memcpy(&stored_handle, slotp, sizeof(stored_handle));
+                    memcpy(&dispatch, slotp + 8, sizeof(dispatch));
+
+                    LOGI("present: RegisterBuffers slot handle=0x%08x dispatch=%p",
+                         (unsigned)stored_handle, dispatch);
+
+                    if (stored_handle == (uint32_t)s_video && dispatch) {
+                        void *receiver = NULL;
+                        void *vtable = NULL;
+                        void *method = NULL;
+
+                        memcpy(&receiver,
+                               (const uint8_t *)dispatch + 0x00,
+                               sizeof(receiver));
+                        memcpy(&vtable,
+                               (const uint8_t *)dispatch + 0x08,
+                               sizeof(vtable));
+
+                        s_reg_probe_receiver = receiver;
+
+                        if (vtable) {
+                            memcpy(&method,
+                                   (const uint8_t *)vtable + 0x50,
+                                   sizeof(method));
+                        }
+
+                        LOGI("present: RegisterBuffers dispatch=%p receiver=%p "
+                             "vtable=%p method50=%p",
+                             dispatch, receiver, vtable, method);
+
+                        if (method) {
+                            log_symbol_256(
+                                "RegisterBuffers.driver_method50", method);
+
+                            /*
+                             * FW 12.50 method50:
+                             *   +0x4e: E8 rel32 -> core RegisterBuffers logic.
+                             *
+                             * Decode/read only. Never call it.
+                             */
+                            const uint8_t *mcode =
+                                (const uint8_t *)method;
+
+                            if (mcode[0x4e] == 0xe8) {
+                                int32_t core_rel = 0;
+                                memcpy(&core_rel,
+                                       mcode + 0x4f,
+                                       sizeof(core_rel));
+
+                                uintptr_t core_addr =
+                                    (uintptr_t)method +
+                                    0x53u +
+                                    (intptr_t)core_rel;
+
+                                void *core = (void *)core_addr;
+
+                                LOGI("present: RegisterBuffers core target=%p rel=%d",
+                                     core, (int)core_rel);
+
+                                log_symbol_512(
+                                    "RegisterBuffers.core", core);
+
+                                /*
+                                 * FW 12.50 RegisterBuffers core:
+                                 *   +0x10a: E8 rel32 -> BufferAttribute validator.
+                                 *
+                                 * Read/decode only. Never call it.
+                                 */
+                                const uint8_t *ccode =
+                                    (const uint8_t *)core;
+
+                                if (ccode[0x10a] == 0xe8) {
+                                    int32_t attr_rel = 0;
+                                    memcpy(&attr_rel,
+                                           ccode + 0x10b,
+                                           sizeof(attr_rel));
+
+                                    uintptr_t attr_addr =
+                                        (uintptr_t)core +
+                                        0x10fu +
+                                        (intptr_t)attr_rel;
+
+                                    void *attr_validator =
+                                        (void *)attr_addr;
+
+                                    LOGI("present: RegisterBuffers attr validator "
+                                         "target=%p rel=%d",
+                                         attr_validator,
+                                         (int)attr_rel);
+
+                                    log_symbol_512(
+                                        "RegisterBuffers.attr_validator",
+                                        attr_validator);
+
+                                    log_symbol_512(
+                                        "RegisterBuffers.attr_validator+200",
+                                        (const uint8_t *)attr_validator + 0x200);
+
+                                    log_symbol_512(
+                                        "RegisterBuffers.attr_validator+400",
+                                        (const uint8_t *)attr_validator + 0x400);
+
+                                    log_symbol_512(
+                                        "RegisterBuffers.attr_validator+5f0",
+                                        (const uint8_t *)attr_validator + 0x5f0);
+
+                                    /*
+                                     * FW 12.50 validator:
+                                     *   +0x724: lea rdx,[rip+disp32]
+                                     *   jump table for tiling mode 0..3.
+                                     *
+                                     * Read only.
+                                     */
+                                    const uint8_t *vcode =
+                                        (const uint8_t *)attr_validator;
+
+                                    if (vcode[0x724] == 0x48 &&
+                                        vcode[0x725] == 0x8d &&
+                                        vcode[0x726] == 0x15) {
+                                        int32_t jt_rel = 0;
+                                        memcpy(&jt_rel,
+                                               vcode + 0x727,
+                                               sizeof(jt_rel));
+
+                                        uintptr_t jt_addr =
+                                            (uintptr_t)attr_validator +
+                                            0x72bu +
+                                            (intptr_t)jt_rel;
+
+                                        int32_t jt[4] = {0};
+                                        memcpy(jt, (const void *)jt_addr,
+                                               sizeof(jt));
+
+                                        LOGI("present: tiling jtab=%p "
+                                             "t0=%p t1=%p t2=%p t3=%p",
+                                             (void *)jt_addr,
+                                             (void *)(jt_addr + jt[0]),
+                                             (void *)(jt_addr + jt[1]),
+                                             (void *)(jt_addr + jt[2]),
+                                             (void *)(jt_addr + jt[3]));
+                                    } else {
+                                        LOGW("present: tiling jtab LEA "
+                                             "opcode unexpected");
+                                    }
+
+                                    log_symbol_512(
+                                        "RegisterBuffers.attr_validator+7b0",
+                                        (const uint8_t *)attr_validator + 0x7b0);
+
+                                    log_symbol_512(
+                                        "RegisterBuffers.attr_validator+af0",
+                                        (const uint8_t *)attr_validator + 0xaf0);
+                                } else {
+                                    LOGW("present: RegisterBuffers attr validator "
+                                         "CALL opcode unexpected=0x%02x",
+                                         (unsigned)ccode[0x10a]);
+                                }
+                            } else {
+                                LOGW("present: RegisterBuffers core CALL "
+                                     "opcode unexpected=0x%02x",
+                                     (unsigned)mcode[0x4e]);
+                            }
+                        }
+                    } else {
+                        LOGW("present: RegisterBuffers slot mismatch");
+                    }
+                }
+            } else {
+                LOGW("present: RegisterBuffers table LEA opcode unexpected");
+            }
+        } else {
+            LOGW("present: RegisterBuffers resolver opcode unexpected=0x%02x",
+                 (unsigned)code[0x31]);
+        }
+    }
+
+    static const char *abi_probe_names[] = {
+        "sceVideoOutAddBuffer4k2kPrivilege",
+        "sceVideoOutAddBufferYccPrivilege",
+        "sceVideoOutAddS3dHmdPrivilege",
+        NULL,
+    };
+
+    for (int i = 0; abi_probe_names[i]; i++) {
+        void *sym = NULL;
+        int32_t rc = sceKernelDlsym(mod, abi_probe_names[i], &sym);
+
+        LOGI("present: privilege ABI symbol=%s rc=0x%08x found=%d",
+             abi_probe_names[i], (unsigned)rc, sym != NULL);
+
+        if (rc == 0 && sym)
+            log_symbol_head(abi_probe_names[i], sym);
+    }
+
+    typedef struct {
+        uint64_t capability;
+    } MlVideoOutDeviceCapabilityInfo;
+
+    typedef int32_t (*cap_fn)(int32_t,
+                              MlVideoOutDeviceCapabilityInfo *,
+                              size_t);
+
+    void *cap_sym = NULL;
+    int32_t drc = sceKernelDlsym(mod,
+                                 "sceVideoOutGetDeviceCapabilityInfo_",
+                                 &cap_sym);
+
+    if (drc == 0 && cap_sym) {
+        MlVideoOutDeviceCapabilityInfo info;
+        memset(&info, 0, sizeof(info));
+
+        int32_t rc = ((cap_fn)cap_sym)(s_video, &info, sizeof(info));
+
+        LOGI("present: 4k capability rc=0x%08x value=0x%016llx size=%zu",
+             (unsigned)rc,
+             (unsigned long long)info.capability,
+             sizeof(info));
+    } else {
+        LOGW("present: 4k capability symbol unavailable rc=0x%08x",
+             (unsigned)drc);
+    }
+
+    typedef struct {
+        uint32_t size;
+        uint8_t signalEncoding;
+        uint8_t signalRange;
+        uint8_t colorimetry;
+        uint8_t depth;
+        uint64_t refreshRate;
+        uint64_t resolution;
+        uint8_t reserved[8];
+    } MlVideoOutModeProbe;
+
+    typedef void (*mode_any_fn)(MlVideoOutModeProbe *, uint32_t);
+
+    void *mode_sym = NULL;
+    int32_t mrc = sceKernelDlsym(mod, "sceVideoOutModeSetAny_", &mode_sym);
+
+    if (mrc == 0 && mode_sym) {
+        MlVideoOutModeProbe mode;
+        memset(&mode, 0xa5, sizeof(mode));
+
+        if (sizeof(mode) != 32) {
+            LOGE("present: mode ABI unexpected local size=%zu", sizeof(mode));
+        } else {
+            ((mode_any_fn)mode_sym)(&mode, (uint32_t)sizeof(mode));
+
+            LOGI("present: mode ABI size=%u struct=%zu "
+                 "enc=0x%02x range=0x%02x color=0x%02x depth=0x%02x "
+                 "refresh=0x%016llx resolution=0x%016llx "
+                 "reserved=%02x%02x%02x%02x%02x%02x%02x%02x",
+                 mode.size, sizeof(mode),
+                 mode.signalEncoding,
+                 mode.signalRange,
+                 mode.colorimetry,
+                 mode.depth,
+                 (unsigned long long)mode.refreshRate,
+                 (unsigned long long)mode.resolution,
+                 mode.reserved[0], mode.reserved[1],
+                 mode.reserved[2], mode.reserved[3],
+                 mode.reserved[4], mode.reserved[5],
+                 mode.reserved[6], mode.reserved[7]);
+        }
+    } else {
+        LOGW("present: mode ABI symbol unavailable rc=0x%08x",
+             (unsigned)mrc);
+    }
+}
+
+static void probe_4k2k_privilege(int video_handle) {
+    typedef int32_t (*priv_fn)(int32_t);
+
+    extern uint32_t sceKernelLoadStartModule(const char *, size_t, const void *,
+                                             uint32_t, void *, void *);
+    extern int32_t sceKernelDlsym(int32_t, const char *, void **);
+
+    static const char *paths[] = {
+        "/system/common/lib/libSceVideoOut.sprx",
+        "libSceVideoOut.sprx",
+        NULL,
+    };
+
+    int mod = -1;
+    for (int i = 0; paths[i]; i++) {
+        int rc = (int)sceKernelLoadStartModule(paths[i], 0, NULL,
+                                               0, NULL, NULL);
+        LOGI("present: 4k2k privilege LoadStartModule(%s) => 0x%08x",
+             paths[i], (unsigned)rc);
+
+        if (rc > 0) {
+            mod = rc;
+            break;
+        }
+    }
+
+    if (mod < 0) {
+        LOGW("present: 4k2k privilege VideoOut SPRX unavailable");
+        return;
+    }
+
+    void *sym = NULL;
+    int32_t drc = sceKernelDlsym(
+        mod, "sceVideoOutAddBuffer4k2kPrivilege", &sym);
+
+    if (drc != 0 || !sym) {
+        LOGW("present: 4k2k privilege Dlsym failed rc=0x%08x",
+             (unsigned)drc);
+        return;
+    }
+
+    int32_t rc = ((priv_fn)sym)(video_handle);
+
+    LOGI("present: 4k2k privilege probe handle=%d => 0x%08x",
+         video_handle, (unsigned)rc);
 }
 
 /* OpenOrbis stub = jmp . (hang). Always Dlsym from the real SPRX. */
@@ -675,7 +1273,11 @@ static void bgra_run_bands(void) {
         int row1 = row0 + BGRA_BAND_ROWS;
         if (row1 > j->dst_h)
             row1 = j->dst_h;
-        if (j->x_lut) {
+        if (j->tiled4k) {
+            fast4k_nv12_to_tiled_rows(j->dst, row0, row1,
+                                      j->y, j->uv,
+                                      j->pitch_y, j->pitch_uv);
+        } else if (j->x_lut) {
             nv12_to_bgra_rows_scaled(j->dst, j->dst_pitch, j->dst_w, row0, row1,
                                      j->dst_h, j->y, j->uv, j->pitch_y, j->pitch_uv,
                                      j->src_h, j->x_lut);
@@ -749,6 +1351,7 @@ static void bgra_worker_start(void) {
     s_bgra_seq = 0;
     s_bgra_next_band = 0;
     s_bgra_job.nbands = 0;
+    s_bgra_job.tiled4k = 0;
     int want = s_bgra_workers;
     int ok = 0;
     for (int i = 0; i < want; i++) {
@@ -790,23 +1393,97 @@ static void bgra_convert_kick(uint8_t *dst, int dst_pitch,
                               int src_w, int src_h, int dst_w, int dst_h,
                               const uint8_t *y, const uint8_t *uv,
                               int pitch_y, int pitch_uv, int main_helps) {
-    const int *lut = (src_w == dst_w && src_h == dst_h)
-                          ? NULL
-                          : scale_lut_get(dst_w, src_w);
+    /*
+     * 3840x2160 BGRA VideoOut is registered as display-tiled on this branch.
+     * A linear writer must NEVER touch that framebuffer.
+     *
+     * First POC deliberately supports only exact 1:1 4K NV12 input.
+     * Scaling into native tiled 4K will be added separately.
+     */
+    const int native4k_tiled =
+        s_use_bgra &&
+        s_width == 3840 &&
+        s_buf_h == 2160;
+
+    const int tiled4k =
+        native4k_tiled &&
+        src_w == 3840 &&
+        src_h == 2160 &&
+        dst_w == 3840 &&
+        dst_h == 2160;
+
+    if (native4k_tiled && !tiled4k) {
+        static int warned_unsupported;
+
+        if (!warned_unsupported) {
+            warned_unsupported = 1;
+            LOGW("present: native 4k tiled stream requires exact "
+                 "3840x2160 NV12 in this POC; got src=%dx%d dst=%dx%d",
+                 src_w, src_h, dst_w, dst_h);
+        }
+
+        /*
+         * Zero is layout-independent, so this produces a safe black
+         * framebuffer instead of corrupting tiled memory with a linear write.
+         */
+        memset(dst, 0, s_fb_size);
+        _mm_sfence();
+        s_bgra_job_us = 0;
+        return;
+    }
+
+    if (tiled4k && fast4k_prepare_lut() != 0) {
+        static int warned_lut;
+
+        if (!warned_lut) {
+            warned_lut = 1;
+            LOGE("present: native 4k stream LUT unavailable; black frame");
+        }
+
+        memset(dst, 0, s_fb_size);
+        _mm_sfence();
+        s_bgra_job_us = 0;
+        return;
+    }
+
+    if (tiled4k) {
+        static int logged_direct4k;
+
+        if (!logged_direct4k) {
+            logged_direct4k = 1;
+            LOGI("present: DIRECT NV12->TILED BGRA 3840x2160 workers=%d "
+                 "band_rows=%d",
+                 s_bgra_workers, BGRA_BAND_ROWS);
+        }
+    }
+
+    const int *lut =
+        tiled4k ? NULL :
+        ((src_w == dst_w && src_h == dst_h)
+             ? NULL
+             : scale_lut_get(dst_w, src_w));
+
     /* LUT unavailable (dst_w > SCALE_LUT_MAX): fall back to 1:1 clipped copy
      * rather than reading out of bounds. */
-    if (!lut && (src_w != dst_w || src_h != dst_h)) {
+    if (!tiled4k && !lut && (src_w != dst_w || src_h != dst_h)) {
         dst_w = src_w < dst_w ? src_w : dst_w;
         dst_h = src_h < dst_h ? src_h : dst_h;
     }
 
     if (!s_bgra_worker_alive || dst_h < 2) {
         uint64_t t0 = now_us();
-        if (lut)
+
+        if (tiled4k) {
+            fast4k_nv12_to_tiled_rows(dst, 0, dst_h,
+                                      y, uv, pitch_y, pitch_uv);
+        } else if (lut) {
             nv12_to_bgra_rows_scaled(dst, dst_pitch, dst_w, 0, dst_h, dst_h,
                                      y, uv, pitch_y, pitch_uv, src_h, lut);
-        else
-            nv12_to_bgra_rows(dst, dst_pitch, dst_w, 0, dst_h, y, uv, pitch_y, pitch_uv);
+        } else {
+            nv12_to_bgra_rows(dst, dst_pitch, dst_w, 0, dst_h,
+                              y, uv, pitch_y, pitch_uv);
+        }
+
         _mm_sfence();
         s_bgra_job_us = now_us() - t0;
         return;
@@ -824,6 +1501,7 @@ static void bgra_convert_kick(uint8_t *dst, int dst_pitch,
     s_bgra_job.pitch_y = pitch_y;
     s_bgra_job.pitch_uv = pitch_uv;
     s_bgra_job.x_lut = lut;
+    s_bgra_job.tiled4k = tiled4k;
     s_bgra_job.nbands = (dst_h + BGRA_BAND_ROWS - 1) / BGRA_BAND_ROWS;
     __atomic_store_n(&s_bgra_next_band, 0, __ATOMIC_RELAXED);
     s_bgra_outstanding = s_bgra_workers;
@@ -921,7 +1599,14 @@ int video_present_init(int w, int h, int prefer_ycbcr) {
         LOGE("present: sceVideoOutOpen failed: 0x%08x", s_video);
         return -1;
     }
+
+    log_resolution_status();
+    log_4k_symbol_probe();
     sceVideoOutSetFlipRate(s_video, ML_VIDEO_OUT_FLIP_60HZ);
+
+    log_4k_receiver_state("pre-privilege");
+    probe_4k2k_privilege(s_video);
+    log_4k_receiver_state("post-privilege");
 
     if (!prefer_ycbcr)
         goto bgra_debug;
@@ -1210,8 +1895,18 @@ static void draw_stats_overlay(uint8_t *dst) {
 }
 
 static void present_submit_flip(int next, uint8_t *dst, uint64_t convert_us) {
-    if (s_show_stats && s_use_bgra)
-        draw_stats_overlay(dst);
+    if (s_show_stats && s_use_bgra) {
+        if (s_width == 3840 && s_buf_h == 2160) {
+            static int warned_tiled_stats;
+
+            if (!warned_tiled_stats) {
+                warned_tiled_stats = 1;
+                LOGW("present: stats overlay disabled on native 4k tiled BGRA");
+            }
+        } else {
+            draw_stats_overlay(dst);
+        }
+    }
 
     __asm__ volatile("sfence" ::: "memory");
     sceGnmFlushGarlic();
@@ -1301,12 +1996,43 @@ int video_present_bgra_pipe_kick(const uint8_t *y, const uint8_t *uv,
     if (s_pipe_active)
         (void)video_present_bgra_pipe_finish();
     if (video_present_should_drop()) {
+        static unsigned diag_busy_drops;
+        diag_busy_drops++;
+
+        if (diag_busy_drops == 1 || (diag_busy_drops % 15u) == 0u) {
+            MlVideoOutFlipStatus st;
+            memset(&st, 0, sizeof(st));
+            int rc = sceVideoOutGetFlipStatus(s_video, &st);
+
+            LOGW("present: DIAG pipe busy-drop count=%u rc=0x%08x "
+                 "pending=%d cur=%d fb_count=%d pipe=%d pipe_fb=%d",
+                 diag_busy_drops, (unsigned)rc,
+                 st.numFlipPending, st.currentBuffer,
+                 s_fb_count, s_pipe_active, s_pipe_fb_idx);
+        }
+
         video_stats_add(0, 0, 0, 1);
         return 0;
     }
 
     int next = pick_free_fb(NULL);
     if (next < 0) {
+        static unsigned diag_no_free_drops;
+        diag_no_free_drops++;
+
+        if (diag_no_free_drops == 1 || (diag_no_free_drops % 15u) == 0u) {
+            MlVideoOutFlipStatus st;
+            memset(&st, 0, sizeof(st));
+            int rc = sceVideoOutGetFlipStatus(s_video, &st);
+
+            LOGW("present: DIAG no-free-fb count=%u rc=0x%08x "
+                 "pending=%d cur=%d fb_count=%d last=%d pipe=%d pipe_fb=%d",
+                 diag_no_free_drops, (unsigned)rc,
+                 st.numFlipPending, st.currentBuffer,
+                 s_fb_count, s_last_flip_idx,
+                 s_pipe_active, s_pipe_fb_idx);
+        }
+
         video_stats_add(0, 0, 0, 1);
         return 0;
     }
@@ -1488,6 +2214,641 @@ int video_ui_flip(int idx) {
     return rc;
 }
 
+
+#define FAST4K_TILE_W 8
+#define FAST4K_TILE_H 8
+#define FAST4K_TILES_X (3840 / FAST4K_TILE_W)
+#define FAST4K_TILES_Y (2160 / FAST4K_TILE_H)
+#define FAST4K_TILE_COUNT (FAST4K_TILES_X * FAST4K_TILES_Y)
+
+/*
+ * One destination base offset per 8x8 display microtile.
+ * 480 * 270 * 4 = ~506 KiB.
+ *
+ * OpenGNM calculates these once; the hot frame path never performs
+ * per-pixel GPU address calculations.
+ */
+static uint32_t s_fast4k_tile_base[FAST4K_TILE_COUNT];
+static int s_fast4k_lut_state; /* 0=uninitialized, 1=ready, -1=failed */
+
+static inline uint32_t fast4k_display_pixel_index(uint32_t x, uint32_t y) {
+    /*
+     * OpenGNM / AMD display microtile ordering for 32 bpp:
+     * bit0=x0 bit1=x1 bit2=y0 bit3=x2 bit4=y1 bit5=y2
+     */
+    return ((x & 1u) << 0) |
+           (((x >> 1) & 1u) << 1) |
+           ((y & 1u) << 2) |
+           (((x >> 2) & 1u) << 3) |
+           (((y >> 1) & 1u) << 4) |
+           (((y >> 2) & 1u) << 5);
+}
+
+static GpaError fast4k_init_tile_lut(const GpaTilingParams *dst_tp,
+                                     size_t dst_len) {
+    if (s_fast4k_lut_state > 0)
+        return GPA_ERR_OK;
+    if (s_fast4k_lut_state < 0)
+        return GPA_ERR_TILING_ERROR;
+
+    uint64_t t0 = now_us();
+
+    GpaSurfaceContext ctx = {0};
+    GpaError err = sceGpaInitSurfaceContext(&ctx, dst_len, dst_tp);
+    if (err != GPA_ERR_OK) {
+        LOGE("present: fast4k LUT context => %d (%s)",
+             (int)err, sceGpaStrError(err));
+        s_fast4k_lut_state = -1;
+        return err;
+    }
+
+    for (uint32_t ty = 0; ty < FAST4K_TILES_Y; ty++) {
+        for (uint32_t tx = 0; tx < FAST4K_TILES_X; tx++) {
+            uint64_t off = 0;
+
+            err = sceGpaComputeSurfaceCoord(
+                &off, NULL, &ctx,
+                tx * FAST4K_TILE_W,
+                ty * FAST4K_TILE_H,
+                0, 0);
+
+            if (err != GPA_ERR_OK || off + 256u > dst_len ||
+                off > UINT32_MAX) {
+                LOGE("present: fast4k LUT failed tile=%u,%u "
+                     "err=%d off=0x%llx dst=0x%zx",
+                     tx, ty, (int)err,
+                     (unsigned long long)off, dst_len);
+                s_fast4k_lut_state = -1;
+                return err != GPA_ERR_OK ? err : GPA_ERR_OVERFLOW;
+            }
+
+            s_fast4k_tile_base[
+                ty * FAST4K_TILES_X + tx] = (uint32_t)off;
+        }
+    }
+
+    /*
+     * Prove our 256-byte-contiguous microtile assumption against
+     * OpenGNM before enabling the optimized path.
+     */
+    static const uint16_t samples[][2] = {
+        {0, 0},
+        {1, 0},
+        {0, 1},
+        {17, 13},
+        {239, 134},
+        {479, 269},
+    };
+
+    for (size_t sidx = 0;
+         sidx < sizeof(samples) / sizeof(samples[0]); sidx++) {
+        uint32_t tx = samples[sidx][0];
+        uint32_t ty = samples[sidx][1];
+        uint64_t base =
+            s_fast4k_tile_base[ty * FAST4K_TILES_X + tx];
+
+        for (uint32_t py = 0; py < 8; py++) {
+            for (uint32_t px = 0; px < 8; px++) {
+                uint64_t actual = 0;
+
+                err = sceGpaComputeSurfaceCoord(
+                    &actual, NULL, &ctx,
+                    tx * 8u + px,
+                    ty * 8u + py,
+                    0, 0);
+
+                uint64_t expected =
+                    base +
+                    (uint64_t)fast4k_display_pixel_index(px, py) * 4u;
+
+                if (err != GPA_ERR_OK || actual != expected) {
+                    LOGE("present: fast4k microtile validation failed "
+                         "tile=%u,%u pixel=%u,%u "
+                         "actual=0x%llx expected=0x%llx err=%d",
+                         tx, ty, px, py,
+                         (unsigned long long)actual,
+                         (unsigned long long)expected,
+                         (int)err);
+                    s_fast4k_lut_state = -1;
+                    return GPA_ERR_TILING_ERROR;
+                }
+            }
+        }
+    }
+
+    s_fast4k_lut_state = 1;
+
+    LOGI("present: fast4k LUT READY tiles=%u bytes=0x%zx init=%.1fms",
+         (unsigned)FAST4K_TILE_COUNT,
+         sizeof(s_fast4k_tile_base),
+         (double)(now_us() - t0) / 1000.0);
+
+    return GPA_ERR_OK;
+}
+
+static GpaError fast4k_tile_bgra(uint8_t *dst, size_t dst_len,
+                                 const uint8_t *src, size_t src_len,
+                                 const GpaTilingParams *dst_tp) {
+    const size_t src_pitch = 3840u * 4u;
+    const size_t required_src = src_pitch * 2160u;
+
+    if (!dst || !src ||
+        src_len < required_src ||
+        dst_len < 0x1fe0000u)
+        return GPA_ERR_OVERFLOW;
+
+    GpaError err = fast4k_init_tile_lut(dst_tp, dst_len);
+    if (err != GPA_ERR_OK)
+        return err;
+
+    /*
+     * 32-bpp display microtile:
+     *
+     * Each source row contributes two contiguous groups of four pixels.
+     * Their destination positions inside the 256-byte tile are also
+     * contiguous, so SSE2 can move 16 bytes at a time.
+     */
+    for (uint32_t ty = 0; ty < FAST4K_TILES_Y; ty++) {
+        const uint8_t *src_tile_row =
+            src + (size_t)ty * 8u * src_pitch;
+
+        for (uint32_t tx = 0; tx < FAST4K_TILES_X; tx++) {
+            uint8_t *td =
+                dst + s_fast4k_tile_base[
+                    ty * FAST4K_TILES_X + tx];
+
+            const uint8_t *ts =
+                src_tile_row + (size_t)tx * 8u * 4u;
+
+            for (uint32_t py = 0; py < 8; py++) {
+                const uint8_t *sr =
+                    ts + (size_t)py * src_pitch;
+
+                /*
+                 * y contributes bits 2,4,5.
+                 * x=0..3 occupy four consecutive pixels.
+                 * x=4..7 occupy another four consecutive pixels +8.
+                 */
+                uint32_t di =
+                    ((py & 1u) << 2) |
+                    (((py >> 1) & 1u) << 4) |
+                    (((py >> 2) & 1u) << 5);
+
+                __m128i a =
+                    _mm_loadu_si128((const __m128i *)(const void *)(sr + 0));
+                __m128i b =
+                    _mm_loadu_si128((const __m128i *)(const void *)(sr + 16));
+
+                _mm_storeu_si128(
+                    (__m128i *)(void *)(td + (size_t)di * 4u), a);
+                _mm_storeu_si128(
+                    (__m128i *)(void *)(td + (size_t)(di + 8u) * 4u), b);
+            }
+        }
+    }
+
+    return GPA_ERR_OK;
+}
+
+
+/*
+ * Ensure the exact same BASE / DISPLAY_2D_THIN LUT used by the proven
+ * menu tiler exists before the streaming workers touch the framebuffer.
+ */
+static int fast4k_prepare_lut(void) {
+    if (s_fast4k_lut_state > 0)
+        return 0;
+
+    if (s_fast4k_lut_state < 0)
+        return -1;
+
+    GpaSurfaceProperties props = {0};
+
+    GpaError err = sceGpaFindOptimalSurface(
+        &props,
+        GPA_SURFACE_COLORDISPLAY,
+        32,                  /* BGRA8888 */
+        1,                   /* one fragment */
+        false,               /* no mipmaps */
+        GNM_GPU_BASE);       /* proven VideoOut layout */
+
+    if (err != GPA_ERR_OK) {
+        LOGE("present: fast4k stream FindOptimalSurface => %d (%s)",
+             (int)err, sceGpaStrError(err));
+        return -1;
+    }
+
+    GpaTilingParams dst_tp = {0};
+
+    dst_tp.tilemode = props.tilemode;
+    dst_tp.mingpumode = GNM_GPU_BASE;
+    dst_tp.linearwidth = 3840;
+    dst_tp.linearheight = 2160;
+    dst_tp.lineardepth = 1;
+    dst_tp.numfragsperpixel = 1;
+    dst_tp.basetiledpitch = 3840;
+    dst_tp.miplevel = 0;
+    dst_tp.arrayslice = 0;
+    dst_tp.surfaceflags = props.flags;
+    dst_tp.bitsperfrag = 32;
+    dst_tp.isblockcompressed = false;
+
+    err = fast4k_init_tile_lut(&dst_tp, s_fb_size);
+
+    if (err != GPA_ERR_OK) {
+        LOGE("present: fast4k stream LUT init => %d (%s)",
+             (int)err, sceGpaStrError(err));
+        return -1;
+    }
+
+    uint32_t flags_raw = 0;
+    memcpy(&flags_raw, &props.flags, sizeof(flags_raw));
+
+    LOGI("present: fast4k stream LUT ready mode=0x%x flags=0x%08x",
+         (unsigned)props.tilemode,
+         (unsigned)flags_raw);
+
+    return 0;
+}
+
+/*
+ * Convert eight luma samples using already-expanded chroma terms and
+ * write those eight BGRA pixels directly into one display microtile row.
+ *
+ * For a fixed py:
+ *
+ *   x=0..3 -> indices di+0..3
+ *   x=4..7 -> indices di+8..11
+ *
+ * Each group is four BGRA pixels = 16 contiguous bytes.
+ */
+static inline __attribute__((always_inline)) void
+fast4k_bgra_store8(uint8_t *tile,
+                   uint32_t di,
+                   __m128i y16,
+                   __m128i rv,
+                   __m128i guv,
+                   __m128i bu,
+                   __m128i a255) {
+    __m128i r = _mm_add_epi16(y16, rv);
+    __m128i g = _mm_sub_epi16(y16, guv);
+    __m128i b = _mm_add_epi16(y16, bu);
+
+    __m128i br = _mm_packus_epi16(b, r);
+    __m128i ga = _mm_packus_epi16(g, a255);
+
+    __m128i bg0 = _mm_unpacklo_epi8(br, ga);
+    __m128i ra0 = _mm_unpackhi_epi8(br, ga);
+
+    __m128i px0 = _mm_unpacklo_epi16(bg0, ra0);
+    __m128i px1 = _mm_unpackhi_epi16(bg0, ra0);
+
+    _mm_storeu_si128(
+        (__m128i *)(void *)(tile + (size_t)di * 4u),
+        px0);
+
+    _mm_storeu_si128(
+        (__m128i *)(void *)(tile + (size_t)(di + 8u) * 4u),
+        px1);
+}
+
+/*
+ * Direct NV12 -> native tiled BGRA for destination rows [row0,row1).
+ *
+ * Existing worker scheduling uses BGRA_BAND_ROWS=32.
+ * 32 is a multiple of the display microtile height (8), therefore two
+ * worker bands never write different rows of the same 8x8 microtile.
+ */
+static void fast4k_nv12_to_tiled_rows(uint8_t *dst,
+                                      int row0, int row1,
+                                      const uint8_t *y,
+                                      const uint8_t *uv,
+                                      int pitch_y,
+                                      int pitch_uv) {
+    if (!dst || !y || !uv)
+        return;
+
+    if (row0 < 0)
+        row0 = 0;
+
+    if (row1 > 2160)
+        row1 = 2160;
+
+    if (row1 <= row0)
+        return;
+
+    /*
+     * NV12 chroma is shared by pairs of luma rows.
+     * Current band boundaries are multiples of 32, hence always even.
+     */
+    if (row0 & 1)
+        row0++;
+
+    if (row1 & 1)
+        row1--;
+
+    const __m128i zero  = _mm_setzero_si128();
+    const __m128i m00ff = _mm_set1_epi16(0x00FF);
+    const __m128i c128  = _mm_set1_epi16(128);
+    const __m128i c179  = _mm_set1_epi16(179);
+    const __m128i c44   = _mm_set1_epi16(44);
+    const __m128i c92   = _mm_set1_epi16(92);
+    const __m128i c227  = _mm_set1_epi16(227);
+    const __m128i a255  = _mm_set1_epi16(255);
+
+    for (int row = row0; row + 1 < row1; row += 2) {
+        const uint8_t *yrow0 =
+            y + (size_t)row * (size_t)pitch_y;
+
+        const uint8_t *yrow1 =
+            yrow0 + pitch_y;
+
+        const uint8_t *uvrow =
+            uv + (size_t)(row / 2) * (size_t)pitch_uv;
+
+        const uint32_t ty0 =
+            (uint32_t)row >> 3;
+
+        const uint32_t ty1 =
+            (uint32_t)(row + 1) >> 3;
+
+        const uint32_t py0 =
+            (uint32_t)row & 7u;
+
+        const uint32_t py1 =
+            (uint32_t)(row + 1) & 7u;
+
+        const uint32_t di0 =
+            fast4k_display_pixel_index(0, py0);
+
+        const uint32_t di1 =
+            fast4k_display_pixel_index(0, py1);
+
+        const uint32_t tile_row0 =
+            ty0 * FAST4K_TILES_X;
+
+        const uint32_t tile_row1 =
+            ty1 * FAST4K_TILES_X;
+
+        for (int x = 0; x < 3840; x += 16) {
+            /*
+             * Keep source reads hot. The +2-row prefetch remains inside
+             * the decoded frame for all practical rows; prefetch itself
+             * is only a hint and does not dereference the address.
+             */
+            _mm_prefetch(
+                (const char *)(yrow0 + (size_t)pitch_y * 2u + x),
+                _MM_HINT_T0);
+
+            _mm_prefetch(
+                (const char *)(uvrow + pitch_uv + x),
+                _MM_HINT_T0);
+
+            /*
+             * 16 interleaved UV bytes = eight chroma samples,
+             * covering sixteen output pixels.
+             *
+             * This is the same SSE2 color conversion math as the
+             * existing proven linear NV12 -> BGRA path.
+             */
+            __m128i uv8 =
+                _mm_loadu_si128(
+                    (const __m128i *)(const void *)(uvrow + x));
+
+            __m128i u16 =
+                _mm_sub_epi16(
+                    _mm_and_si128(uv8, m00ff),
+                    c128);
+
+            __m128i v16 =
+                _mm_sub_epi16(
+                    _mm_srli_epi16(uv8, 8),
+                    c128);
+
+            __m128i rv =
+                _mm_srai_epi16(
+                    _mm_mullo_epi16(v16, c179),
+                    7);
+
+            __m128i guv =
+                _mm_srai_epi16(
+                    _mm_add_epi16(
+                        _mm_mullo_epi16(u16, c44),
+                        _mm_mullo_epi16(v16, c92)),
+                    7);
+
+            __m128i bu =
+                _mm_srai_epi16(
+                    _mm_mullo_epi16(u16, c227),
+                    7);
+
+            /* Duplicate each chroma sample to its two luma pixels. */
+            __m128i rv_lo  = _mm_unpacklo_epi16(rv, rv);
+            __m128i rv_hi  = _mm_unpackhi_epi16(rv, rv);
+            __m128i guv_lo = _mm_unpacklo_epi16(guv, guv);
+            __m128i guv_hi = _mm_unpackhi_epi16(guv, guv);
+            __m128i bu_lo  = _mm_unpacklo_epi16(bu, bu);
+            __m128i bu_hi  = _mm_unpackhi_epi16(bu, bu);
+
+            __m128i yy0 =
+                _mm_loadu_si128(
+                    (const __m128i *)(const void *)(yrow0 + x));
+
+            __m128i yy1 =
+                _mm_loadu_si128(
+                    (const __m128i *)(const void *)(yrow1 + x));
+
+            /*
+             * x advances 16 pixels at a time:
+             *
+             * tx     = first 8x8 tile
+             * tx + 1 = second 8x8 tile
+             */
+            const uint32_t tx =
+                (uint32_t)x >> 3;
+
+            uint8_t *r0_tile0 =
+                dst + s_fast4k_tile_base[tile_row0 + tx];
+
+            uint8_t *r0_tile1 =
+                dst + s_fast4k_tile_base[tile_row0 + tx + 1u];
+
+            uint8_t *r1_tile0 =
+                dst + s_fast4k_tile_base[tile_row1 + tx];
+
+            uint8_t *r1_tile1 =
+                dst + s_fast4k_tile_base[tile_row1 + tx + 1u];
+
+            fast4k_bgra_store8(
+                r0_tile0,
+                di0,
+                _mm_unpacklo_epi8(yy0, zero),
+                rv_lo,
+                guv_lo,
+                bu_lo,
+                a255);
+
+            fast4k_bgra_store8(
+                r0_tile1,
+                di0,
+                _mm_unpackhi_epi8(yy0, zero),
+                rv_hi,
+                guv_hi,
+                bu_hi,
+                a255);
+
+            fast4k_bgra_store8(
+                r1_tile0,
+                di1,
+                _mm_unpacklo_epi8(yy1, zero),
+                rv_lo,
+                guv_lo,
+                bu_lo,
+                a255);
+
+            fast4k_bgra_store8(
+                r1_tile1,
+                di1,
+                _mm_unpackhi_epi8(yy1, zero),
+                rv_hi,
+                guv_hi,
+                bu_hi,
+                a255);
+        }
+    }
+}
+
+/*
+ * Correctness-first native 4K VideoOut tiling POC.
+ *
+ * The UI renders into a normal linear BGRA staging buffer. FW 12.50 accepts
+ * the 3840x2160 VideoOut buffer only through the tiled path, so convert the
+ * staging image into the PS4 Pro display-macro-tiled layout before flip.
+ *
+ * This is intentionally the OpenGNM reference implementation, not optimized.
+ */
+static int tile_4k_bgra_display(uint8_t *dst, size_t dst_len,
+                                const uint8_t *src, size_t src_len,
+                                int w, int h) {
+    static int info_logged;
+    static int timing_logs;
+
+    GpaSurfaceProperties props = {0};
+    GpaError err = sceGpaFindOptimalSurface(
+        &props,
+        GPA_SURFACE_COLORDISPLAY,
+        32,                 /* BGRA8888 */
+        1,                  /* one fragment */
+        false,              /* no mipmaps */
+        GNM_GPU_BASE);       /* BASE layout probe */
+
+    if (err != GPA_ERR_OK) {
+        LOGE("present: 4k tile FindOptimalSurface => %d (%s)",
+             (int)err, sceGpaStrError(err));
+        return -1;
+    }
+
+    GpaTilingParams src_tp = {0};
+    src_tp.tilemode = GNM_TM_DISPLAY_LINEAR_GENERAL;
+    src_tp.mingpumode = GNM_GPU_BASE;
+    src_tp.linearwidth = (uint32_t)w;
+    src_tp.linearheight = (uint32_t)h;
+    src_tp.lineardepth = 1;
+    src_tp.numfragsperpixel = 1;
+    src_tp.basetiledpitch = (uint32_t)w;
+    src_tp.miplevel = 0;
+    src_tp.arrayslice = 0;
+    src_tp.surfaceflags = props.flags;
+    src_tp.bitsperfrag = 32;
+    src_tp.isblockcompressed = false;
+
+    GpaTilingParams dst_tp = src_tp;
+    dst_tp.tilemode = props.tilemode;
+
+    GpaSurfaceInfo src_info = {0};
+    GpaSurfaceInfo dst_info = {0};
+
+    err = sceGpaComputeSurfaceInfo(&src_info, &src_tp);
+    if (err != GPA_ERR_OK) {
+        LOGE("present: 4k tile src SurfaceInfo => %d (%s)",
+             (int)err, sceGpaStrError(err));
+        return -1;
+    }
+
+    err = sceGpaComputeSurfaceInfo(&dst_info, &dst_tp);
+    if (err != GPA_ERR_OK) {
+        LOGE("present: 4k tile dst SurfaceInfo => %d (%s)",
+             (int)err, sceGpaStrError(err));
+        return -1;
+    }
+
+    if (!info_logged) {
+        info_logged = 1;
+        LOGI("present: 4k tile mode=0x%x flags=0x%08x "
+             "src pitch=%u h=%u size=0x%llx align=0x%x "
+             "dst pitch=%u h=%u size=0x%llx align=0x%x "
+             "buffers src=0x%zx dst=0x%zx",
+             (unsigned)props.tilemode,
+             *(const uint32_t *)(const void *)&props.flags,
+             src_info.pitch, src_info.height,
+             (unsigned long long)src_info.surfacesize,
+             src_info.basealign,
+             dst_info.pitch, dst_info.height,
+             (unsigned long long)dst_info.surfacesize,
+             dst_info.basealign,
+             src_len, dst_len);
+    }
+
+    if (src_info.surfacesize > src_len ||
+        dst_info.surfacesize > dst_len) {
+        LOGE("present: 4k tile buffer too small "
+             "src_need=0x%llx src_have=0x%zx "
+             "dst_need=0x%llx dst_have=0x%zx",
+             (unsigned long long)src_info.surfacesize, src_len,
+             (unsigned long long)dst_info.surfacesize, dst_len);
+        return -1;
+    }
+
+    uint64_t t0 = now_us();
+
+    int fast_used = 0;
+
+    err = fast4k_tile_bgra(
+        dst, dst_len,
+        src, src_len,
+        &dst_tp);
+
+    if (err == GPA_ERR_OK) {
+        fast_used = 1;
+    } else {
+        LOGW("present: fast4k unavailable => reference tiler "
+             "err=%d (%s)",
+             (int)err, sceGpaStrError(err));
+
+        err = sceGpaTileSurface(
+            dst, dst_len,
+            src, src_len,
+            &src_tp, &dst_tp);
+    }
+
+    uint64_t us = now_us() - t0;
+
+    if (err != GPA_ERR_OK) {
+        LOGE("present: 4k tile Surface => %d (%s) time=%.1fms",
+             (int)err, sceGpaStrError(err), (double)us / 1000.0);
+        return -1;
+    }
+
+    if (timing_logs < 8) {
+        timing_logs++;
+        LOGI("present: 4k tile %s OK mode=0x%x time=%.1fms",
+             fast_used ? "FAST" : "REF",
+             (unsigned)props.tilemode, (double)us / 1000.0);
+    }
+
+    return 0;
+}
+
 /*
  * Present a full BGRA frame from staging (pitch in bytes).
  * Atomic copy to backbuffer → flip. Preferred for the menu.
@@ -1513,7 +2874,16 @@ int video_ui_present(const uint8_t *src, int src_pitch) {
     uint8_t *dst = (uint8_t *)s_fb_cpu[next];
     int rows = s_buf_h;
     size_t row_bytes = (size_t)s_width * 4u;
-    if (src_pitch == s_pitch && (size_t)src_pitch == row_bytes) {
+
+    if (s_width == 3840 && s_buf_h == 2160 &&
+        src_pitch == 3840 * 4) {
+        size_t src_len = (size_t)src_pitch * (size_t)rows;
+        if (tile_4k_bgra_display(dst, s_fb_size,
+                                 src, src_len,
+                                 s_width, rows) != 0) {
+            return -1;
+        }
+    } else if (src_pitch == s_pitch && (size_t)src_pitch == row_bytes) {
         memcpy(dst, src, row_bytes * (size_t)rows);
     } else {
         for (int r = 0; r < rows; r++) {

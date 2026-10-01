@@ -89,7 +89,7 @@ index 2b5182e..e107910 100644
              return -1;
          }
 diff --git a/src/PlatformSockets.c b/src/PlatformSockets.c
-index cec96f3..00942fe 100644
+index cec96f3..34b524a 100644
 --- a/src/PlatformSockets.c
 +++ b/src/PlatformSockets.c
 @@ -45,9 +45,9 @@ void addrToUrlSafeString(struct sockaddr_storage* addr, char* string, size_t str
@@ -178,7 +178,71 @@ index cec96f3..00942fe 100644
      if (udpSocket == INVALID_SOCKET) {
          return LastSocketError();
      }
-@@ -763,11 +775,11 @@ bool isInSubnetV6(struct sockaddr_in6* sin6, unsigned char* subnet, int prefixLe
+@@ -674,6 +686,63 @@ int resolveHostName(const char* host, int family, int tcpTestPort, struct sockad
+     int err;
+     bool needsFallbackV4 = false;
+ 
++#if defined(__ORBIS__) || defined(__PS4__) || defined(__OPENORBIS__)
++    /*
++     * Numeric IPv4 literals need no DNS resolution.
++     *
++     * OpenOrbis uses the BSD sockaddr_in byte layout:
++     *   byte 0 = length
++     *   byte 1 = family
++     *
++     * getaddrinfo() with AI_ADDRCONFIG has been observed returning -11
++     * even for a valid numeric address such as 192.168.x.x, while direct
++     * TCP connections to the same address work correctly.
++     */
++    if (family == AF_INET || family == AF_UNSPEC) {
++        struct sockaddr_in sin4;
++
++        memset(&sin4, 0, sizeof(sin4));
++
++        if (inet_pton(AF_INET, host, &sin4.sin_addr) == 1) {
++            uint8_t* raw = (uint8_t*)&sin4;
++
++            raw[0] = (uint8_t)sizeof(sin4);
++            raw[1] = (uint8_t)AF_INET;
++
++            memset(addr, 0, sizeof(*addr));
++            memcpy(addr, &sin4, sizeof(sin4));
++            *addrLen = (SOCKADDR_LEN)sizeof(sin4);
++
++            /*
++             * Preserve the original resolveHostName() semantics:
++             * a single resolved address is only TCP-tested when the caller
++             * explicitly requests TCP_PORT_FLAG_ALWAYS_TEST.
++             */
++            if (tcpTestPort != 0 &&
++                (tcpTestPort & TCP_PORT_FLAG_ALWAYS_TEST)) {
++                SOCKET testSocket = connectTcpSocket(
++                    addr,
++                    *addrLen,
++                    tcpTestPort & TCP_PORT_MASK,
++                    TEST_PORT_TIMEOUT_SEC);
++
++                if (testSocket == INVALID_SOCKET) {
++                    Limelog("resolveHostName: numeric IPv4 test port %d failed\n",
++                            tcpTestPort & TCP_PORT_MASK);
++                    return -1;
++                }
++
++                closeSocket(testSocket);
++            }
++
++            Limelog("resolveHostName: numeric IPv4 fast path %s\n",
++                    host);
++
++            return 0;
++        }
++    }
++#endif
++
+     memset(&hints, 0, sizeof(hints));
+     hints.ai_family = family;
+     hints.ai_flags = AI_ADDRCONFIG;
+@@ -763,11 +832,11 @@ bool isInSubnetV6(struct sockaddr_in6* sin6, unsigned char* subnet, int prefixLe
  #endif
  
  bool isPrivateNetworkAddress(struct sockaddr_storage* address) {
@@ -192,7 +256,7 @@ index cec96f3..00942fe 100644
          struct sockaddr_in6* sin6 = (struct sockaddr_in6*)address;
          static unsigned char linkLocalPrefix[] = {0xfe, 0x80};
          static unsigned char siteLocalPrefix[] = {0xfe, 0xc0};
-@@ -793,7 +805,7 @@ bool isPrivateNetworkAddress(struct sockaddr_storage* address) {
+@@ -793,7 +862,7 @@ bool isPrivateNetworkAddress(struct sockaddr_storage* address) {
  
  bool isNat64SynthesizedAddress(struct sockaddr_storage* address) {
  #ifdef AF_INET6

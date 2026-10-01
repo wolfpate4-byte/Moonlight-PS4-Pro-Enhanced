@@ -16,3 +16,6 @@
 	path = third_party/h264bitstream
 	url = https://github.com/aizvorski/h264bitstream.git
 	# pin: 70124d3051ba45e6b326264f0b25e6f48a7479e7
+[submodule "third_party/opengnm"]
+	path = third_party/opengnm
+	url = https://github.com/PS4-OpenGNM/opengnm.git

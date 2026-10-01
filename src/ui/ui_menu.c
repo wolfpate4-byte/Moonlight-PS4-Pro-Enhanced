@@ -15,8 +15,8 @@
 #include <orbis/SystemService.h>
 #endif
 
-#define UI_W 1920
-#define UI_H 1080
+#define UI_W 3840
+#define UI_H 2160
 #define UI_MAX_APPS 64
 
 /* Colors 0xAARRGGBB (BGRA LE). */
@@ -226,8 +226,8 @@ static void set_value_str(const ui_state_t *st, int row, char *out, size_t cap) 
 }
 
 static void cycle_res(app_config_t *c, int dir) {
-    static const int presets[][2] = { {1280, 720}, {1920, 1080} };
-    const int n = 2;
+    static const int presets[][2] = { {1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160} };
+    const int n = 4;
     int cur = 1;
     for (int i = 0; i < n; i++) {
         if (c->stream.width == presets[i][0] && c->stream.height == presets[i][1]) {

@@ -84,6 +84,13 @@ if(PS4)
         ${COMMON_SOURCES}
         ${GAMESTREAM_SOURCES}
     )
+    # Native PS4 surface-address / tiling support used by the PS4 Pro 4K30 path.
+    # Pinned as a git submodule for reproducible builds.
+    set(OPENGNM_PLATFORM "orbis" CACHE STRING "" FORCE)
+    set(OPENGNM_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(OPENGNM_SUBMIT_WRAPPERS OFF CACHE BOOL "" FORCE)
+    add_subdirectory(third_party/opengnm EXCLUDE_FROM_ALL)
+
     target_include_directories(moonlight-ps4.elf PRIVATE
         src
         ${FFMPEG_PS4_PREFIX}/include
@@ -91,6 +98,7 @@ if(PS4)
     )
     target_link_libraries(moonlight-ps4.elf PRIVATE
         moonlight-common-c
+        opengnm::opengnm
         enet
         mbedtls mbedx509 mbedcrypto
         opus

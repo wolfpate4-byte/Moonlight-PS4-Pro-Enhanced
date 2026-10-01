@@ -47,6 +47,18 @@ typedef struct {
     uint32_t reserved1;
 } MlVideoOutFlipStatus;
 
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t paneWidth;
+    uint32_t paneHeight;
+    uint64_t refreshRate;
+    float screenSize;
+    uint16_t flags;
+    uint16_t reserved0;
+    uint32_t reserved1[3];
+} MlVideoOutResolutionStatus;
+
 int32_t sceVideoOutOpen(int32_t userId, int32_t busType, int32_t index, const void *param);
 int32_t sceVideoOutClose(int32_t handle);
 int32_t sceVideoOutRegisterBuffers(int32_t handle, int32_t startIndex, void *const *addrs,
@@ -58,6 +70,8 @@ void sceVideoOutSetBufferAttribute(void *attr, uint32_t pixelFormat, uint32_t ti
                                    uint32_t pitchInPixel);
 int32_t sceVideoOutSetFlipRate(int32_t handle, int32_t flipRate);
 int32_t sceVideoOutGetFlipStatus(int32_t handle, MlVideoOutFlipStatus *status);
+int32_t sceVideoOutGetResolutionStatus(int32_t handle,
+                                       MlVideoOutResolutionStatus *status);
 /* Do NOT declare AddBufferYccPrivilege / SysUpdatePrivilege here: the
  * OpenOrbis stub is `jmp .` (infinite hang). Resolve via Dlsym from the real SPRX. */
 

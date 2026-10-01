@@ -14,6 +14,8 @@
 #include <emmintrin.h>
 #include <smmintrin.h> /* MOVNTDQA — correct load from WC_GARLIC */
 
+extern uint64_t LiGetMicroseconds(void);
+
 #define DMEM_ALIGN ML_DMEM_ALIGN
 #define ERR_RESET_THRESHOLD 30
 #define BOUNCE_WORKERS 4
@@ -604,7 +606,11 @@ static int dr_submit(PDECODE_UNIT du) {
      * steady state (it would spuriously skip frames).
      */
     int skip_present = 0;
-    if (video_present_flip_backlogged())
+    int skip_flip = video_present_flip_backlogged() ? 1 : 0;
+    int skip_pts = 0;
+    int64_t pts_late_us = 0;
+
+    if (skip_flip)
         skip_present = 1;
 
     if (du->presentationTimeUs) {
@@ -615,8 +621,62 @@ static int dr_submit(PDECODE_UNIT du) {
         } else {
             int64_t expected = (int64_t)s_time_base_us +
                                (int64_t)(du->presentationTimeUs - s_pts_base);
-            if ((int64_t)now_us() - expected > 33000)
-                skip_present = 1;
+            pts_late_us = (int64_t)now_us() - expected;
+            if (pts_late_us > 33000) {
+                /*
+                 * Do not drop solely on presentationTimeUs lateness.
+                 *
+                 * Sunshine repeated/cadence frames can legitimately appear
+                 * >33 ms late relative to this locally anchored PTS model
+                 * while spending only tens of microseconds in the actual
+                 * Moonlight decode queue. Keep this as diagnostic state only.
+                 *
+                 * Real VideoOut backlog protection remains active via
+                 * skip_flip / video_present_flip_backlogged().
+                 */
+                skip_pts = 1;
+            }
+        }
+    }
+
+    /*
+     * Diagnostic only. Do not change presentation behaviour here.
+     * Log the first skip in a run, then every 15th skip to keep file I/O low.
+     */
+    {
+        static unsigned diag_skip_run;
+        static unsigned diag_skip_total;
+
+        if (skip_present || skip_pts) {
+            diag_skip_run++;
+            diag_skip_total++;
+
+            if (diag_skip_run == 1 || (diag_skip_run % 15u) == 0u) {
+                uint64_t diag_now = LiGetMicroseconds();
+                unsigned long long queue_age_us =
+                    (du->enqueueTimeUs && diag_now >= du->enqueueTimeUs)
+                    ? (unsigned long long)(diag_now - du->enqueueTimeUs) : 0;
+                unsigned long long assemble_us =
+                    (du->enqueueTimeUs >= du->receiveTimeUs)
+                    ? (unsigned long long)(du->enqueueTimeUs - du->receiveTimeUs) : 0;
+
+                LOGW("orbis: DIAG pre-present event frame=%d bytes=%d "
+                     "drop=%d flip=%d pts=%d late_us=%lld queue_us=%llu "
+                     "assemble_us=%llu hostlat_0p1ms=%u",
+                     du->frameNumber, total,
+                     skip_present, skip_flip, skip_pts,
+                     (long long)pts_late_us,
+                     queue_age_us, assemble_us,
+                     (unsigned)du->frameHostProcessingLatency);
+            }
+        } else if (diag_skip_run) {
+            LOGI("orbis: DIAG pre-present recovered run=%u total=%u "
+                 "frame=%d late_us=%lld hostlat_0p1ms=%u",
+                 diag_skip_run, diag_skip_total,
+                 du->frameNumber,
+                 (long long)pts_late_us,
+                 (unsigned)du->frameHostProcessingLatency);
+            diag_skip_run = 0;
         }
     }
 
