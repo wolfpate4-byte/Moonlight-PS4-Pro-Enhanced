@@ -1,0 +1,140 @@
+name: Bug report
+description: Report a reproducible issue with Moonlight PS4 Pro Enhanced
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue.
+
+        For streaming problems, please attach the PS4 Moonlight log from `/data/moonlight/debug.log` and the matching Sunshine log if possible.
+
+  - type: dropdown
+    id: ps4_model
+    attributes:
+      label: PS4 model
+      options:
+        - PS4 Pro
+        - PS4 Slim
+        - Base PS4
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: firmware
+    attributes:
+      label: PS4 firmware
+      placeholder: "Example: 12.50"
+    validations:
+      required: true
+
+  - type: input
+    id: goldhen
+    attributes:
+      label: GoldHEN version
+      placeholder: "Example: 2.4b18.7"
+    validations:
+      required: true
+
+  - type: input
+    id: sunshine
+    attributes:
+      label: Sunshine version
+      placeholder: "Example: 2026.516.143833"
+
+  - type: dropdown
+    id: network
+    attributes:
+      label: Network connection
+      options:
+        - Ethernet
+        - Wi-Fi
+        - Wi-Fi / Mesh
+        - Other
+
+  - type: input
+    id: resolution
+    attributes:
+      label: Stream resolution
+      placeholder: "Example: 3840x2160"
+
+  - type: input
+    id: fps
+    attributes:
+      label: Stream FPS
+      placeholder: "Example: 30"
+
+  - type: input
+    id: bitrate
+    attributes:
+      label: Bitrate
+      placeholder: "Example: 40000 kbps"
+
+  - type: input
+    id: codec
+    attributes:
+      label: Codec
+      placeholder: "Example: H.264"
+
+  - type: dropdown
+    id: hw_decoder
+    attributes:
+      label: Hardware decoder
+      options:
+        - Enabled
+        - Disabled
+        - Unknown
+
+  - type: dropdown
+    id: ycbcr
+    attributes:
+      label: YCbCr
+      options:
+        - Disabled
+        - Enabled
+        - Unknown
+
+  - type: input
+    id: game
+    attributes:
+      label: Game / application
+      placeholder: "Example: Satisfactory"
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the problem as clearly as possible.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start Moonlight
+        2. Connect to host
+        3. Start game
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / additional information
+      description: Attach or paste relevant Moonlight and Sunshine log excerpts here.
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Firmware 9.00 YCbCr patch
+      options:
+        - label: If my firmware is not 9.00, I did not use `ycbcr_kpatch_900.bin`.
